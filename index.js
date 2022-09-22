@@ -19,6 +19,16 @@ var TableName = "messageAuthTable";
 
 var JWT_SECRET = "very real and safe secret *taidaSip*";
 
+var AUTHORIZED = {
+    "isAuthorized": true,
+    "deniedFields": []
+};
+
+var UNAUTHORIZED = {
+    "isAuthorized": false,
+    "deniedFields": [ "*" ]
+};
+
 async function broadcasterGet(broadcasterId) {
     var params = {
         TableName: TableName,
@@ -110,6 +120,54 @@ async function broadcasterUpdate(broadcaster) {
             }
         });
     });
+}
+
+async function authSelection(jwt, selection) {
+    var selectionName = Object.keys(selection)[0];
+    var arguments = selection[selectionName];
+    for(var i = 0; i < arguments.length; i++) {
+        var argument = arguments[i];
+
+        switch(selectionName) {
+            case "createUpdateMessage":
+            case "updateUpdateMessage":
+            case "deleteUpdateMessage":
+                if(!("input" in argument) || !("userid" in argument["input"])) {
+                    console.error(`Invalid argument ${argument} for ${selectionName}. Rejecting.`);
+                    return false;
+                }
+                target = argument["input"].userid;
+                break;
+            case "getUpdateMessage":
+            case "onUpdateMessage":
+                if(!("userid" in argument)) {
+                    console.error(`Invalid argument ${argument} for ${selectionName}. Rejecting.`);
+                    return false;
+                }
+                target = argument;
+                break;
+            case "listUpdateMessages":
+            case "onCreateUpdateMessage":
+            case "onDeleteUpdateMessage":
+                console.error(`Illegal request to resource ${selectionName}. Rejecting.`);
+                return false;
+                //target = "*";
+                //break;
+            default:
+                console.error(`Invalid request to unknown resource ${selectionName}. Rejecting.`);
+                return false;
+        }
+
+        if(await handleAuth(jwt, selectionName, target)) {
+            console.log(`Allowed access to ${target} for ${selectionName}`);
+            continue;
+        } else {
+            console.log(`Rejected acccess to ${target} for ${selectionName}`);
+            return false;
+        }
+    }
+
+    return true;
 }
 
 class _API {
@@ -266,6 +324,15 @@ function parseOperation(operation, variables) {
     return ret;
 }
 
+function simplifyQuery(query) {
+    var k = Object.keys(query);
+    var ret = []
+    for(var i = 0; i < k.length; i++) {
+        ret = ret.concat(query[k]);
+    }
+    return ret;
+}
+
 function parseQuery(queryString, variables, schema = false, operationName = false) {
     var query = parse(queryString);
     var operations = !operationName ? 
@@ -274,7 +341,10 @@ function parseQuery(queryString, variables, schema = false, operationName = fals
     var ret = {}
 
     if(schema) {
-        validate(schema, query);
+        var err = validate(schema, query);
+        if(err.length > 0) {
+            throw new Error(JSON.stringify(err));
+        }
     }
 
     for(var i = 0; i < operations.length; i++) {
@@ -287,7 +357,6 @@ function parseQuery(queryString, variables, schema = false, operationName = fals
 
     return ret;
 }
-
 
 exports.handler = async (event) => {
     // TODO implement
@@ -308,73 +377,23 @@ exports.handler = async (event) => {
                 ]
             };
         }
-        var query = parse(event.requestContext["queryString"]);
-        var t = validate(schema, query);
-        if(t.length > 0) {
-            console.error(t);
-            throw new Error("Invalid query");
+        var operationName = event.requestContext["operationName"] || false;
+        var authorized = true;
+        var query = parseQuery(event.requestContext["queryString"], event.requestContext["variables"], schema, operationName);
+        var selections = simplifyQuery(query);
+        for(var i = 0; i < selections.length; i++) {
+            authorized = authorized && await authSelection(token, selections[i]);
         }
-        if(event.requestContext["operationName"]) {
-            var definitions = query.definitions.filter(e => e.name.value == event.requestContext["operationName"]);
+        if(authorized) {
+            console.log(`Authorized access to ${token.target} for ${token.userid}`);
+            return AUTHORIZED;
         } else {
-            var definitions = query.definitions;
-        }
-        var authorized = false;
-        var deniedFields = [ "*" ];
-        for(var i = 0; i < definitions.length; i++) {
-            var definition = definitions[i];
-            console.log(definition);
-            if(definition.selectionSet.selections.length != 1) {
-                console.error(query.definitions);
-                throw new Error("Invalid queries");
-            }
-            var selection = definition.selectionSet.selections[0];
-            console.log(selection);
-            var argument = selection.arguments.filter(e => (e.name ? e.name.value == "userid" : false))[0].value;
-            console.log(argument);
-            var target;
-            switch(argument.kind) {
-                case "Variable":
-                    target = event.requestContext["variables"][argument.name.value];
-                    break;
-                case "StringValue":
-                    target = argument.value;
-                    break;
-                default:
-                    throw new Error(`Invalid argument kind ${argument.kind}`);
-            }
-            if(await handleAuth(token, selection.name.value, target)) {
-                console.log(`Authorized ${selection.name.value} access to ${target} for ${token.userid}`);
-                if(i == 0) {
-                    authorized = true;
-                    deniedFields = [];
-                }
-                continue;
-                /*response = {
-                    "isAuthorized": true,
-                    "deniedFields": []
-                };*/
-            } else {
-                console.log(`Rejected ${selection.name.value} access to ${target} for ${token.userid}`);
-                authorized = false;
-                deniedFields = [ "*" ];
-                /*response = {
-                    "isAuthorized": false,
-                    "deniedFields": [
-                        "*"
-                    ]
-                };*/
-            }
-            //response.isAuthorized = true;
+            console.log(`Rejected access to ${token.target} for ${token.userid}`);
+            return UNAUTHORIZED;
         }
     } catch(e) {
-        console.log(e);
-        return {
-            "isAuthorized": false,
-            "deniedFields": [
-                "*"
-            ]
-        };
+        console.error(e);
+        return UNAUTHORIZED;
     }
     /*var resources = {};
     for(var i = 0; i < query.definitions; i++) {
@@ -391,9 +410,5 @@ exports.handler = async (event) => {
             resources[r].concat()
         }
     }*/
-    response = {
-        "isAuthorized": authorized,
-        "deniedFields": deniedFields
-    }
     return response;
 };
